@@ -39,9 +39,9 @@ class StagingArea(object):
         self.build = this['build']
         self.install = this['install']
 
-    def run(self, args):
+    def run_cmd(self, this, command):
 #       call(sandbox.containerised_cmdline(args))
-        print(sandbox.containerised_cmdline(args))
+        print(sandbox.containerised_cmdline(command))
 
     def stage(self, component):
         unpackdir = self._unpack_artifact(component)

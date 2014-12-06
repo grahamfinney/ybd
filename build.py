@@ -65,20 +65,20 @@ def build(this):
 
     defs = Definitions()
     env = {'DESTDIR': this['install'], 'PREFIX': '/usr'}
-    with app.chdir(this['build'], env):
+    with sandbox.chroot(this['build'], env):
         if defs.lookup(this, 'repo') != []:
             repos.checkout(this)
             get_upstream_version(defs, this)
             get_build_system_commands(defs, this)
 
             for command in defs.lookup(this, 'configure-commands'):
-                app.run_cmd(this, command)
+                stage.run_cmd(this, command)
 
             for command in defs.lookup(this, 'build-commands'):
-                app.run_cmd(this, command)
+                stage.run_cmd(this, command)
 
             for command in defs.lookup(this, 'install-commands'):
-                app.run_cmd(this, command)
+                stage.run_cmd(this, command)
 
         cache.cache(this)
 
