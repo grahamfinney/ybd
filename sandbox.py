@@ -17,60 +17,91 @@
 
 import contextlib
 import os
-import textwrap
 from subprocess import call
 import app
+import cache
 from definitions import Definitions
 import shutil
+import utils
 
 
 @contextlib.contextmanager
-def setup(this, build_env):
+def setup(this):
 
     currentdir = os.getcwd()
-
     currentenv = dict(os.environ)
+
+    this['assembly'] = os.path.join(app.settings['assembly'], this['name'])
+    this['build'] = os.path.join(this['assembly'], this['name']+ '.build')
+    this['install'] = os.path.join(this['assembly'], this['name'] + '.inst')
+    for directory in ['assembly', 'build', 'install']:
+        os.makedirs(this[directory])
+
+    build_env = create_env(this)
+
     try:
-        assembly_dir = app.settings['assembly']
-#        for directory in ['dev', 'etc', 'lib', 'usr', 'bin', 'tmp']:
-        for directory in ['dev', 'tmp']:
-            call(['mkdir', '-p', os.path.join(assembly_dir, directory)])
-
-        devnull = os.path.join(assembly_dir, 'dev/null')
-        if not os.path.exists(devnull):
-            call(['sudo', 'mknod', devnull, 'c', '1', '3'])
-            call(['sudo', 'chmod', '666', devnull])
-
-        for key, value in (currentenv.items() + build_env.env.items()):
-            if key in build_env.env:
-                os.environ[key] = build_env.env[key]
+        for key, value in (currentenv.items() + build_env.items()):
+            if key in build_env:
+                os.environ[key] = build_env[key]
             else:
                 os.environ.pop(key)
 
-        os.chdir(app.settings['assembly'])
+        os.chdir(this['build'])
 
         yield
+
     finally:
-        for key, value in currentenv.items():
-            if value:
-                os.environ[key] = value
-            else:
-                del os.environ[key]
+        os.environ = currentenv
         os.chdir(currentdir)
+
+
+def install_artifact(component, installdir):
+    app.log(component, 'Installing artifact in', installdir)
+    unpackdir = unpack_artifact(component)
+    utils.hardlink_all_files(unpackdir, installdir)
+
+
+def unpack_artifact(component):
+    cachefile = cache.get_cache(component)
+    if cachefile:
+        unpackdir = cachefile + '.unpacked'
+        if not os.path.exists(unpackdir):
+            os.makedirs(unpackdir)
+            call(['tar', 'xf', cachefile, '--directory', unpackdir])
+        return unpackdir
+
+    app.log(component, 'Cached artifact not found')
+    raise SystemExit
+
 
 def cleanup(this):
     if this['build'] and this['install']:
         shutil.rmtree(this['build'])
         shutil.rmtree(this['install'])
 
-def run_cmd(this, command):
 
+def just_run(this, command):
+    cmd_list = ['sh', '-c', command]
+    log = os.path.join(app.settings['assembly'], this['cache'] + '.build-log')
+    with open(log, "a") as logfile:
+        logfile.write("# # %s\n" % command)
+    app.log_env(log, '\n'.join(cmd_list))
+    with open(log, "a") as logfile:
+        if call(cmd_list, stdout=logfile, stderr=logfile):
+            app.log(this, 'ERROR: in directory', os.getcwd())
+            app.log(this, 'ERROR: command failed:\n\n', cmd_list)
+            app.log(this, 'ERROR: log file at', log)
+            raise SystemExit
+    call(['mv', log, app.settings['artifacts']])
+
+
+def run_cmd(this, command):
     argv = ['sh', '-c', command]
     use_chroot = True if this.get('build-mode') != 'bootstrap' else False
     do_not_mount_dirs = [this['build'], this['install']]
 
     if use_chroot:
-        chroot_dir = app.settings['assembly']
+        chroot_dir = this['assembly']
         chdir = os.path.join('/', os.path.basename(this['build']))
         do_not_mount_dirs += [os.path.join(app.settings['assembly'], d)
                               for d in  ["dev", "proc", 'tmp']]
@@ -91,9 +122,9 @@ def run_cmd(this, command):
         binds=binds,
         writable_paths=do_not_mount_dirs)
 
-    cmd_list = containerised_cmdline(argv, **container_config)
+    cmd_list = utils.containerised_cmdline(argv, **container_config)
 
-    log = os.path.join(app.settings['artifacts'], this['cache'] + '.build-log')
+    log = os.path.join(app.settings['assembly'], this['cache'] + '.build-log')
     with open(log, "a") as logfile:
         logfile.write("# # %s\n" % command)
     app.log_env(log, '\n'.join(cmd_list))
@@ -101,7 +132,9 @@ def run_cmd(this, command):
         if call(cmd_list, stdout=logfile, stderr=logfile):
             app.log(this, 'ERROR: in directory', os.getcwd())
             app.log(this, 'ERROR: command failed:\n\n', cmd_list)
+            app.log(this, 'ERROR: log file at', log)
             raise SystemExit
+    call(['mv', log, app.settings['artifacts']])
 
 
 def get_binds(this):
@@ -110,7 +143,7 @@ def get_binds(this):
     else:
         ccache_dir = os.path.join(app.settings['ccache_dir'],
                                   os.path.basename(this['name']))
-        ccache_target = os.path.join(app.settings['assembly'],
+        ccache_target = os.path.join(this['assembly'],
                                      os.environ['CCACHE_DIR'].lstrip('/'))
         if not os.path.isdir(ccache_dir):
             os.mkdir(ccache_dir)
@@ -121,187 +154,63 @@ def get_binds(this):
     return binds
 
 
-def containerised_cmdline(args, cwd='.', root='/', binds=(),
-                          mount_proc=False, unshare_net=False,
-                          writable_paths=None, **kwargs):
-    '''
-    Describe how to run 'args' inside a linux-user-chroot container.
+def create_env(this):
+    _base_path = ['/sbin', '/usr/sbin', '/bin', '/usr/bin']
+    env = {}
+    extra_path = []
+    defs = Definitions()
 
-    The subprocess will only be permitted to write to the paths we
-    specifically allow it to write to, listed in 'writeable paths'. All
-    other locations in the file system will be read-only.
+    prefixes = [this.get('prefix', '/usr')]
+    for name in defs.lookup(this, 'build-depends'):
+        dependency = defs.get(name)
+        prefixes.append(dependency.get('prefix'))
+    prefixes = set(prefixes)
+    for prefix in prefixes:
+        if prefix:
+            bin_path = os.path.join(prefix, 'bin')
+            extra_path += [bin_path]
 
-    The 'binds' parameter allows mounting of arbitrary file-systems,
-    such as tmpfs, before running commands, by setting it to a list of
-    (mount_point, mount_type, source) triples.
+    ccache_path = []
+    if not app.settings['no-ccache']:
+        ccache_path = ['/usr/lib/ccache']
+        env['CCACHE_DIR'] = '/tmp/ccache'
+        env['CCACHE_EXTRAFILES'] = ':'.join(
+            f for f in ('/baserock/binutils.meta',
+                        '/baserock/eglibc.meta',
+                        '/baserock/gcc.meta') if os.path.exists(f))
+        if not app.settings.get('no-distcc'):
+            env['CCACHE_PREFIX'] = 'distcc'
 
-    The 'root' parameter allows running the command in a chroot, allowing
-    the host file system to be hidden completely except for the paths
-    below 'root'.
+    if this.get('build-mode', 'staging') == 'staging':
+        path = extra_path + ccache_path + _base_path
+    else:
+        rel_path = extra_path + ccache_path
+        full_path = [os.path.normpath(this['assembly'] + p) for p in rel_path]
+        path = full_path + os.environ['PATH'].split(':')
 
-    The 'mount_proc' flag enables mounting of /proc inside 'root'.
-    Locations from the file system can be bind-mounted inside 'root' by
-    setting 'binds' to a list of (src, dest) pairs. The 'dest'
-    directory must be inside 'root'.
+    env['PATH'] = ':'.join(path)
 
-    The subprocess will be run in a separate mount namespace. It can
-    optionally be run in a separate network namespace too by setting
-    'unshare_net'.
+    if this.get('build-mode') == 'bootstrap':
+        env['DESTDIR'] = this.get('install')
+    else:
+        env['DESTDIR'] = os.path.join('/',
+                                      os.path.basename(this.get('install')))
 
-    '''
+    env['TERM'] = 'dumb'
+    env['SHELL'] = '/bin/sh'
+    env['USER'] = env['USERNAME'] = env['LOGNAME'] = 'tomjon'
+    env['LC_ALL'] = 'C'
+    env['HOME'] = '/tmp/'
+    env['DESTDIR'] = this.get('install')
+    env['PREFIX'] = this.get('prefix') or '/usr'
+    env['MAKEFLAGS'] = '-j%s' % (this.get('max_jobs') or app.settings['max_jobs'])
+#    env['MAKEFLAGS'] = '-j1'
 
-    if not root.endswith('/'):
-        root += '/'
-    if writable_paths is None:
-        writable_paths = (root,)
+    arch = app.settings['arch']
+    cpu = 'i686' if arch == 'x86_32' else arch
+    abi = 'eabi' if arch.startswith('arm') else ''
+    env['TARGET'] = cpu + '-baserock-linux-gnu' + abi
+    env['TARGET_STAGE1'] = cpu + '-bootstrap-linux-gnu' + abi
+    env['MORPH_ARCH'] = arch
 
-    cmdargs = ['linux-user-chroot', '--chdir', cwd]
-    if unshare_net:
-        cmdargs.append('--unshare-net')
-    for src, dst in binds:
-        # linux-user-chroot's mount target paths are relative to the chroot
-        cmdargs.extend(('--mount-bind', src, os.path.relpath(dst, root)))
-    for d in invert_paths(os.walk(root), writable_paths):
-        if not os.path.islink(d):
-            cmdargs.extend(('--mount-readonly', os.path.relpath(d, root)))
-    if mount_proc:
-        proc_target = os.path.join(root, 'proc')
-        if not os.path.exists(proc_target):
-            os.makedirs(proc_target)
-        cmdargs.extend(('--mount-proc', 'proc'))
-    cmdargs.append(root)
-    cmdargs.extend(args)
-
-    return unshared_cmdline(cmdargs, root=root, **kwargs)
-
-
-def unshared_cmdline(args, root='/', mounts=()):
-    '''Describe how to run 'args' inside a separate mount namespace.
-
-    This function wraps 'args' in a rather long commandline that ensures
-    the subprocess cannot see any of the system's mounts other than those
-    listed in 'mounts', and mounts done by that command can only be seen
-    by that subprocess and its children. When the subprocess exits all
-    of its mounts will be unmounted.
-
-    '''
-    # We need to do mounts in a different namespace. Unfortunately
-    # this means we have to in-line the mount commands in the
-    # command-line.
-
-    command = textwrap.dedent(r'''
-    mount --make-rprivate /
-    root="$1"
-    shift
-    ''')
-    cmdargs = [root]
-
-    # We need to mount all the specified mounts in the namespace,
-    # we don't need to unmount them before exiting, as they'll be
-    # unmounted when the namespace is no longer used.
-    command += textwrap.dedent(r'''
-    while true; do
-        case "$1" in
-        --)
-            shift
-            break
-            ;;
-        *)
-            mount_point="$1"
-            mount_type="$2"
-            mount_source="$3"
-            shift 3
-            path="$root/$mount_point"
-            mount -t "$mount_type" "$mount_source" "$path"
-            ;;
-        esac
-    done
-    ''')
-    for mount_point, mount_type, source in mounts:
-        path = os.path.join(root, mount_point)
-        if not os.path.exists(path):
-            os.makedirs(path)
-        cmdargs.extend((mount_point, mount_type, source))
-    cmdargs.append('--')
-
-    command += textwrap.dedent(r'''
-    exec "$@"
-    ''')
-    cmdargs.extend(args)
-
-    # The single - is just a shell convention to fill $0 when using -c,
-    # since ordinarily $0 contains the program name.
-    cmdline = ['unshare', '--mount', '--', 'sh', '-ec', command, '-']
-    cmdline.extend(cmdargs)
-    return cmdline
-
-
-def invert_paths(tree_walker, paths):
-    '''List paths from `tree_walker` that are not in `paths`.
-
-    Given a traversal of a tree and a set of paths separated by os.sep,
-    return the files and directories that are not part of the set of
-    paths, culling directories that do not need to be recursed into,
-    if the traversal supports this.
-
-    `tree_walker` is expected to follow similar behaviour to `os.walk()`.
-
-    This function will remove directores from the ones listed, to avoid
-    traversing into these subdirectories, if it doesn't need to.
-
-    As such, if a directory is returned, it is implied that its contents
-    are also not in the set of paths.
-
-    If the tree walker does not support culling the traversal this way,
-    such as `os.walk(root, topdown=False)`, then the contents will also
-    be returned.
-
-    The purpose for this is to list the directories that can be made
-    read-only, such that it would leave everything in paths writable.
-
-    Each path in `paths` is expected to begin with the same path as
-    yielded by the tree walker.
-
-    '''
-
-    def normpath(path):
-        if path == '.':
-            return path
-        path = os.path.normpath(path)
-        if not os.path.isabs(path):
-            path = os.path.join('.', path)
-        return path
-
-    def any_paths_are_subpath_of(prefix):
-        prefix = normpath(prefix)
-        norm_paths = (normpath(path) for path in paths)
-        return any(path[:len(prefix)] == prefix
-                   for path in norm_paths)
-
-    def path_is_listed(path):
-        return any(normpath(path) == normpath(other)
-                   for other in paths)
-
-    for dirpath, dirnames, filenames in tree_walker:
-
-        if path_is_listed(dirpath):
-            # No subpaths need to be considered
-            del dirnames[:]
-            del filenames[:]
-        elif any_paths_are_subpath_of(dirpath):
-            # Subpaths may be marked, or may not, need to leave this
-            # writable, so don't yield, but we don't cull.
-            pass
-        else:
-            # not listed as a parent or an exact match, needs to be
-            # yielded, but we don't need to consider subdirs, so can cull
-            yield dirpath
-            del dirnames[:]
-            del filenames[:]
-
-        for filename in filenames:
-            fullpath = os.path.join(dirpath, filename)
-            if path_is_listed(fullpath):
-                pass
-            else:
-                yield fullpath
+    return env
