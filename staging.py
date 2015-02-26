@@ -95,8 +95,9 @@ class StagingArea(object):
                               ' destination has %s' % (srcpath, destpath))
 
             for entry in os.listdir(srcpath):
-                self._hardlink_all_files(os.path.join(srcpath, entry),
-                                         os.path.join(destpath, entry))
+                destpath_joined = os.path.join(destpath, entry)
+                if os.path.lexists(destpath_joined):
+                    self._hardlink_all_files(destpath_joined)
         elif stat.S_ISLNK(mode):
             # Copy the symlink.
             if os.path.lexists(destpath):
