@@ -83,12 +83,15 @@ def remove(this):
 
 def install(this, component, permit_bootstrap=True):
     component = Definitions().get(component)
+    
     for subcomponent in component.get('contents', []):
-        install_artifact(this, subcomponent, False)
+        if component.get('build-mode') == 'bootstrap':
+            continue
+        install(this, subcomponent, False)
+
     for dependency in component.get('build-depends', []):
         install(this, dependency, False)
     install_artifact(this, component, permit_bootstrap)
-
 
 def install_artifact(this, component, permit_bootstrap=True):
     component = Definitions().get(component)
